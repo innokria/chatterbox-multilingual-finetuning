@@ -167,7 +167,7 @@ class ChatterboxMultilingualTTS:
 
         return cls(t3, s3gen, ve, tokenizer, conds)
         
-   @classmethod
+    @classmethod
     def from_pretrained(cls, device: torch.device) -> "ChatterboxMultilingualTTS":
         ckpt_dir = Path(
             snapshot_download(
