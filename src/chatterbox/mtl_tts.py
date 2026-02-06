@@ -166,22 +166,27 @@ class ChatterboxMultilingualTTS:
             conds = Conditionals.load(conds_path).to(DEVICE)
 
         return cls(t3, s3gen, ve, tokenizer, conds)
-
-    @classmethod
-    def from_pretrained(cls):
-        ckpt_dir = snapshot_download(
-            repo_id=REPO_ID,
-            repo_type="model",
-            allow_patterns=[
-                "ve.pt",
-                "t3_mtl23ls_v2.safetensors",
-                "s3gen.pt",
-                "grapheme_mtl_merged_expanded_v1.json",
-                "conds.pt",
-            ],
-            token=os.getenv("HF_TOKEN"),
+        
+   @classmethod
+    def from_pretrained(cls, device: torch.device) -> "ChatterboxMultilingualTTS":
+        ckpt_dir = Path(
+            snapshot_download(
+                repo_id=REPO_ID,
+                repo_type="model",
+                revision="main",
+                allow_patterns=[
+                    "ve.pt",
+                    "t3_mtl23ls_v2.safetensors",
+                    "s3gen.pt",
+                    "grapheme_mtl_merged_expanded_v1.json",
+                    "conds.pt",
+                    "Cangjie5_TC.json",
+                ],
+                token=os.getenv("HF_TOKEN"),
+            )
         )
-        return cls.from_local(ckpt_dir)
+        return cls.from_local(ckpt_dir, device)
+    
 
     # --------------------------------------------------
     # CONDITION PREP
