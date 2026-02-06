@@ -18,9 +18,13 @@ from .models.voice_encoder import VoiceEncoder
 from .models.t3.modules.cond_enc import T3Cond
 
 
+# ======================================================
+# GLOBAL CPU DEVICE
+# ======================================================
+DEVICE = torch.device("cpu")
+
 REPO_ID = "ResembleAI/chatterbox"
 
-# Supported languages for the multilingual model
 SUPPORTED_LANGUAGES = {
     "ar": "Arabic",
     "da": "Danish",
@@ -49,22 +53,15 @@ SUPPORTED_LANGUAGES = {
 
 
 def punc_norm(text: str) -> str:
-    """
-    Quick cleanup func for punctuation from LLMs or
-    containing chars not seen often in the dataset
-    """
-    if len(text) == 0:
+    if not text:
         return "You need to add some text for me to talk."
 
-    # Capitalise first letter
     if text[0].islower():
         text = text[0].upper() + text[1:]
 
-    # Remove multiple space chars
     text = " ".join(text.split())
 
-    # Replace uncommon/llm punc
-    punc_to_replace = [
+    replacements = [
         ("...", ", "),
         ("…", ", "),
         (":", ","),
@@ -78,359 +75,193 @@ def punc_norm(text: str) -> str:
         ("‘", "'"),
         ("’", "'"),
     ]
-    for old_char_sequence, new_char in punc_to_replace:
-        text = text.replace(old_char_sequence, new_char)
+    for a, b in replacements:
+        text = text.replace(a, b)
 
-    # Add full stop if no ending punc
-    text = text.rstrip(" ")
-    sentence_enders = {".", "!", "?", "-", ",", "、", "，", "。", "？", "！"}
-    if not any(text.endswith(p) for p in sentence_enders):
+    if not text.endswith((".", "!", "?", ",")):
         text += "."
 
     return text
 
 
+# ======================================================
+# CONDITION STRUCT
+# ======================================================
 @dataclass
 class Conditionals:
-    """
-    Conditionals for T3 and S3Gen
-    - T3 conditionals:
-        - speaker_emb
-        - clap_emb
-        - cond_prompt_speech_tokens
-        - cond_prompt_speech_emb
-        - emotion_adv
-    - S3Gen conditionals:
-        - prompt_token
-        - prompt_token_len
-        - prompt_feat
-        - prompt_feat_len
-        - embedding
-    """
-
     t3: T3Cond
     gen: dict
 
-    def to(self, device):
-        self.t3 = self.t3.to(device=device)
+    def to(self, device=DEVICE):
+        self.t3 = self.t3.to(device)
         for k, v in self.gen.items():
             if torch.is_tensor(v):
-                self.gen[k] = v.to(device=device)
+                self.gen[k] = v.to(device)
         return self
 
     def save(self, fpath: Path):
-        arg_dict = dict(t3=self.t3.__dict__, gen=self.gen)
-        torch.save(arg_dict, fpath)
+        torch.save(
+            {"t3": self.t3.__dict__, "gen": self.gen},
+            fpath,
+        )
 
     @classmethod
-    def load(cls, fpath, map_location="cpu"):
-        kwargs = torch.load(fpath, map_location=map_location, weights_only=True)
-        return cls(T3Cond(**kwargs["t3"]), kwargs["gen"])
+    def load(cls, fpath):
+        data = torch.load(fpath, map_location="cpu", weights_only=True)
+        return cls(T3Cond(**data["t3"]), data["gen"])
 
 
+# ======================================================
+# MAIN TTS CLASS
+# ======================================================
 class ChatterboxMultilingualTTS:
     ENC_COND_LEN = 6 * S3_SR
     DEC_COND_LEN = 10 * S3GEN_SR
 
-    def __init__(
-        self,
-        t3: T3,
-        s3gen: S3Gen,
-        ve: VoiceEncoder,
-        tokenizer: MTLTokenizer,
-        device: str,
-        conds: Conditionals = None,
-    ):
-        self.sr = S3GEN_SR  # sample rate of synthesized audio
+    def __init__(self, t3, s3gen, ve, tokenizer, conds=None):
+        self.device = DEVICE
+        self.sr = S3GEN_SR
         self.t3 = t3
         self.s3gen = s3gen
         self.ve = ve
         self.tokenizer = tokenizer
-        self.device = device
         self.conds = conds
         self.watermarker = perth.PerthImplicitWatermarker()
 
+    # --------------------------------------------------
+    # LOADERS
+    # --------------------------------------------------
     @classmethod
-    def get_supported_languages(cls):
-        """Return dictionary of supported language codes and names."""
-        return SUPPORTED_LANGUAGES.copy()
-
-    @classmethod
-    def from_local(cls, ckpt_dir, device) -> "ChatterboxMultilingualTTS":
+    def from_local(cls, ckpt_dir):
         ckpt_dir = Path(ckpt_dir)
 
         ve = VoiceEncoder()
-        ve.load_state_dict(torch.load(ckpt_dir / "ve.pt", weights_only=True))
-        ve.to(device).eval()
+        ve.load_state_dict(torch.load(ckpt_dir / "ve.pt", map_location="cpu", weights_only=True))
+        ve.to(DEVICE).eval()
 
         t3 = T3(T3Config.multilingual())
+
+        # CPU-safe attention
+        if hasattr(t3.tfmr.config, "attn_implementation"):
+            t3.tfmr.config.attn_implementation = "eager"
+
         t3_state = load_safetensors(ckpt_dir / "t3_mtl23ls_v2.safetensors")
-        if "model" in t3_state.keys():
+        if "model" in t3_state:
             t3_state = t3_state["model"][0]
+
         t3.load_state_dict(t3_state)
-        t3.to(device).eval()
+        t3.to(DEVICE).eval()
 
         s3gen = S3Gen()
-        s3gen.load_state_dict(torch.load(ckpt_dir / "s3gen.pt", weights_only=True))
-        s3gen.to(device).eval()
+        s3gen.load_state_dict(
+            torch.load(ckpt_dir / "s3gen.pt", map_location="cpu", weights_only=True)
+        )
+        s3gen.to(DEVICE).eval()
 
         tokenizer = MTLTokenizer(str(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"))
 
         conds = None
         conds_path = ckpt_dir / "conds.pt"
         if conds_path.exists():
-           conds = Conditionals.load(conds_path, map_location="cpu").to(device)
+            conds = Conditionals.load(conds_path).to(DEVICE)
 
-
-        
-
-        return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
+        return cls(t3, s3gen, ve, tokenizer, conds)
 
     @classmethod
-    def from_pretrained(cls, device: torch.device) -> "ChatterboxMultilingualTTS":
-        ckpt_dir = Path(
-            snapshot_download(
-                repo_id=REPO_ID,
-                repo_type="model",
-                revision="main",
-                allow_patterns=[
-                    "ve.pt",
-                    "t3_mtl23ls_v2.safetensors",
-                    "s3gen.pt",
-                    "grapheme_mtl_merged_expanded_v1.json",
-                    "conds.pt",
-                    "Cangjie5_TC.json",
-                ],
-                token=os.getenv("HF_TOKEN"),
-            )
+    def from_pretrained(cls):
+        ckpt_dir = snapshot_download(
+            repo_id=REPO_ID,
+            repo_type="model",
+            allow_patterns=[
+                "ve.pt",
+                "t3_mtl23ls_v2.safetensors",
+                "s3gen.pt",
+                "grapheme_mtl_merged_expanded_v1.json",
+                "conds.pt",
+            ],
+            token=os.getenv("HF_TOKEN"),
         )
-        print("NEVER CALED ===============================")
-        return cls.from_local(ckpt_dir, device)
+        return cls.from_local(ckpt_dir)
 
-    @classmethod
-    def from_checkpoint(
-        cls, save_dir, device=torch.device("cpu")
-    ) -> "ChatterboxMultilingualTTS":
-        ckpt_dir = Path(
-            snapshot_download(
-                repo_id=REPO_ID,
-                repo_type="model",
-                revision="main",
-                allow_patterns=[
-                    "ve.pt",
-                    "t3_mtl23ls_v2.safetensors",
-                    "s3gen.pt",
-                    "grapheme_mtl_merged_expanded_v1.json",
-                    "conds.pt",
-                    "Cangjie5_TC.json",
-                ],
-                token=os.getenv("HF_TOKEN"),
-            )
-        )
-        ckpt_dir = Path(ckpt_dir)
-        print("rahul load checkijt")
-
-        ve = VoiceEncoder()
-        ve.load_state_dict(torch.load(ckpt_dir / "ve.pt", map_location="cpu", weights_only=True))
-        ve.to(device).eval()
-
-        t3 = T3(T3Config.multilingual())
-        # --------------------------------------------------
-
-        
-        tfmr_cfg = t3.tfmr.config   
-        # 🔥 FORCE eager attention (CPU-safe)
-        if hasattr(t3.tfmr.config, "attn_implementation"):
-           t3.tfmr.config.attn_implementation = "eager"
-
-        if hasattr(t3.tfmr, "set_attn_implementation"):
-          try:
-            t3.tfmr.set_attn_implementation("eager")
-          except Exception:
-               pass
-            
-        t3_state = load_safetensors(save_dir + "t3_mtl23ls_v2.safetensors")
-        if "model" in t3_state.keys():
-            t3_state = t3_state["model"][0]
-        t3.load_state_dict(t3_state)
-        t3.to(device).eval()
-
-        s3gen = S3Gen()
-        s3gen.load_state_dict(torch.load(ckpt_dir / "s3gen.pt", map_location="cpu", weights_only=True))
-        s3gen.to(device).eval()
-
-        tokenizer = MTLTokenizer(str(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"))
-
-        conds = Conditionals.load(save_dir + "conds.pt",map_location="cpu").to(device)
-        print("rahul load the confa")
-       # conds = Conditionals.load(conds_path, map_location="cpu").to(device)
-
-        return cls(t3, s3gen, ve, tokenizer, device, conds=conds)
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-    
+    # --------------------------------------------------
+    # CONDITION PREP
+    # --------------------------------------------------
     def prepare_conditionals(self, wav_fpath, exaggeration=0.5):
-        ## Load reference wav
-        s3gen_ref_wav, _sr = librosa.load(wav_fpath, sr=S3GEN_SR)
+        wav, _ = librosa.load(wav_fpath, sr=S3GEN_SR)
+        wav_16k = librosa.resample(wav, S3GEN_SR, S3_SR)
 
-        ref_16k_wav = librosa.resample(s3gen_ref_wav, orig_sr=S3GEN_SR, target_sr=S3_SR)
+        wav = wav[: self.DEC_COND_LEN]
 
-        s3gen_ref_wav = s3gen_ref_wav[: self.DEC_COND_LEN]
-        s3gen_ref_dict = self.s3gen.embed_ref(
-            s3gen_ref_wav, S3GEN_SR, device=self.device
-        )
+        gen_dict = self.s3gen.embed_ref(wav, S3GEN_SR, device=self.device)
 
-        # Speech cond prompt tokens
-        t3_cond_prompt_tokens = None
-        if plen := self.t3.hp.speech_cond_prompt_len:
-            s3_tokzr = self.s3gen.tokenizer
-            t3_cond_prompt_tokens, _ = s3_tokzr.forward(
-                [ref_16k_wav[: self.ENC_COND_LEN]], max_len=plen
+        tokens = None
+        if self.t3.hp.speech_cond_prompt_len:
+            tokens, _ = self.s3gen.tokenizer.forward(
+                [wav_16k[: self.ENC_COND_LEN]],
+                max_len=self.t3.hp.speech_cond_prompt_len,
             )
-            t3_cond_prompt_tokens = torch.atleast_2d(t3_cond_prompt_tokens).to(
-                self.device
-            )
+            tokens = torch.atleast_2d(tokens).to(self.device)
 
-        # Voice-encoder speaker embedding
         ve_embed = torch.from_numpy(
-            self.ve.embeds_from_wavs([ref_16k_wav], sample_rate=S3_SR)
-        )
-        ve_embed = ve_embed.mean(axis=0, keepdim=True).to(self.device)
+            self.ve.embeds_from_wavs([wav_16k], sample_rate=S3_SR)
+        ).mean(0, keepdim=True).to(self.device)
 
         t3_cond = T3Cond(
             speaker_emb=ve_embed,
-            cond_prompt_speech_tokens=t3_cond_prompt_tokens,
+            cond_prompt_speech_tokens=tokens,
             emotion_adv=exaggeration * torch.ones(1, 1, 1),
-        ).to(device=self.device)
-        self.conds = Conditionals(t3_cond, s3gen_ref_dict)
+        ).to(self.device)
 
+        self.conds = Conditionals(t3_cond, gen_dict)
+
+    # --------------------------------------------------
+    # GENERATION
+    # --------------------------------------------------
     def generate(
-    self,
-    text,
-    language_id,
-    audio_prompt_path=None,
-    exaggeration=0.5,
-    cfg_weight=0.5,
-    temperature=0.8,
-    repetition_penalty=2.0,
-    min_p=0.05,
-    top_p=1.0,
-):
-    # --------------------------------------------------
-    # Validate language
-    # --------------------------------------------------
-     if language_id and language_id.lower() not in SUPPORTED_LANGUAGES:
-        supported_langs = ", ".join(SUPPORTED_LANGUAGES.keys())
-        raise ValueError(
-            f"Unsupported language_id '{language_id}'. "
-            f"Supported languages: {supported_langs}"
-        )
-
-    # --------------------------------------------------
-    # Prepare conditionals
-    # --------------------------------------------------
-     if audio_prompt_path:
-        self.prepare_conditionals(audio_prompt_path, exaggeration=exaggeration)
-     else:
-        assert self.conds is not None, (
-            "Please `prepare_conditionals` first or specify `audio_prompt_path`"
-        )
-
-    # --------------------------------------------------
-    # Update exaggeration safely (CPU pinned)
-    # --------------------------------------------------
-     if float(exaggeration) != float(self.conds.t3.emotion_adv[0, 0, 0].item()):
-        _cond: T3Cond = self.conds.t3
-        self.conds.t3 = T3Cond(
-            speaker_emb=_cond.speaker_emb,
-            cond_prompt_speech_tokens=_cond.cond_prompt_speech_tokens,
-            emotion_adv=exaggeration
-            * torch.ones(1, 1, 1, device=self.device),
-        ).to(device=self.device)
-
-    # --------------------------------------------------
-    # Normalize + tokenize text
-    # --------------------------------------------------
-     text = punc_norm(text)
-     text_tokens = self.tokenizer.text_to_tokens(
+        self,
         text,
-        language_id=language_id.lower() if language_id else None,
-     ).to(device=self.device, dtype=torch.long)
+        language_id,
+        audio_prompt_path=None,
+        exaggeration=0.5,
+        cfg_weight=0.5,
+        temperature=0.8,
+        repetition_penalty=2.0,
+        min_p=0.05,
+        top_p=1.0,
+    ):
+        if language_id not in SUPPORTED_LANGUAGES:
+            raise ValueError(f"Unsupported language: {language_id}")
 
-    # Duplicate for CFG
-     text_tokens = torch.cat([text_tokens, text_tokens], dim=0)
+        if audio_prompt_path:
+            self.prepare_conditionals(audio_prompt_path, exaggeration)
+        elif self.conds is None:
+            raise RuntimeError("Conditionals not prepared")
 
-    # Add SOT / EOT
-     sot = self.t3.hp.start_text_token
-     eot = self.t3.hp.stop_text_token
-     text_tokens = F.pad(text_tokens, (1, 0), value=sot)
-     text_tokens = F.pad(text_tokens, (0, 1), value=eot)
+        text = punc_norm(text)
 
-    # --------------------------------------------------
-    # SAFETY: force eager attention (SDPA breaks output_attentions)
-    # --------------------------------------------------
-     cfg = self.t3.tfmr.config
-     if getattr(cfg, "attn_implementation", None) != "eager":
-        cfg.attn_implementation = "eager"
+        tokens = self.tokenizer.text_to_tokens(text, language_id).to(self.device)
+        tokens = torch.cat([tokens, tokens], dim=0)
 
-    # --------------------------------------------------
-    # Inference
-    # --------------------------------------------------
-     with torch.inference_mode():
-        speech_tokens = self.t3.inference(
-            t3_cond=self.conds.t3,
-            text_tokens=text_tokens,
-            max_new_tokens=1000,  # TODO: pull from config
-            temperature=temperature,
-            cfg_weight=cfg_weight,
-            repetition_penalty=repetition_penalty,
-            min_p=min_p,
-            top_p=top_p,
-        )
+        tokens = F.pad(tokens, (1, 0), value=self.t3.hp.start_text_token)
+        tokens = F.pad(tokens, (0, 1), value=self.t3.hp.stop_text_token)
 
-        # Take conditional batch only
-        speech_tokens = speech_tokens[0]
+        with torch.inference_mode():
+            speech_tokens = self.t3.inference(
+                t3_cond=self.conds.t3,
+                text_tokens=tokens,
+                max_new_tokens=1000,
+                temperature=temperature,
+                cfg_weight=cfg_weight,
+                repetition_penalty=repetition_penalty,
+                min_p=min_p,
+                top_p=top_p,
+            )[0]
 
-        # Clean tokens
-        speech_tokens = drop_invalid_tokens(speech_tokens)
-        speech_tokens = speech_tokens.to(self.device)
+            speech_tokens = drop_invalid_tokens(speech_tokens)
 
-        # Vocoder
-        wav, _ = self.s3gen.inference(
-            speech_tokens=speech_tokens,
-            ref_dict=self.conds.gen,
-        )
+            wav, _ = self.s3gen.inference(
+                speech_tokens=speech_tokens,
+                ref_dict=self.conds.gen,
+            )
 
-        wav = wav.squeeze(0).detach().cpu().numpy()
-        # wav = self.watermarker.apply_watermark(wav, sample_rate=self.sr)
-
-     return torch.from_numpy(wav).unsqueeze(0)
+        return wav.squeeze(0).cpu()
