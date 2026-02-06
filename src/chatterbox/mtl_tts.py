@@ -131,8 +131,12 @@ class ChatterboxMultilingualTTS:
     # --------------------------------------------------
     # LOADERS
     # --------------------------------------------------
+    #@classmethod
     @classmethod
-    def from_local(cls, ckpt_dir):
+    def from_local(cls, ckpt_dir, device="cpu"):
+    # your existing code
+
+    #def from_local(cls, ckpt_dir):
         ckpt_dir = Path(ckpt_dir)
 
         ve = VoiceEncoder()
