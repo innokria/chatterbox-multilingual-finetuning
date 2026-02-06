@@ -166,8 +166,11 @@ class ChatterboxMultilingualTTS:
 
         conds = None
         conds_path = ckpt_dir / "conds.pt"
+        conds = Conditionals.load(conds_path)
+         # manually move internal tensors if needed
+        conds.t3 = conds.t3.cpu()  # or .to('cpu')
         if conds_path.exists():
-            conds = Conditionals.load(conds_path).to(DEVICE)
+            #conds = Conditionals.load(conds_path).to(DEVICE)
 
         return cls(t3, s3gen, ve, tokenizer, conds)
         
