@@ -97,16 +97,21 @@ REPO_ID = "ResembleAI/chatterbox"
 # ======================================================
 # CONDITION STRUCT
 # ======================================================
+
 @dataclass
 class Conditionals:
     t3: T3Cond
     gen: dict
 
     def to(self, device=DEVICE):
-        self.t3 = self.t3.to(device)
+        # IMPORTANT: T3Cond.to() takes NO arguments
+        self.t3 = self.t3.to()
+
+        # Move generator tensors manually
         for k, v in self.gen.items():
             if torch.is_tensor(v):
                 self.gen[k] = v.to(device)
+
         return self
 
     def save(self, fpath: Path):
