@@ -22,66 +22,7 @@ from .models.t3.modules.cond_enc import T3Cond
 # GLOBAL CPU DEVICE
 # ======================================================
 DEVICE = torch.device("cpu")
-
 REPO_ID = "ResembleAI/chatterbox"
-
-SUPPORTED_LANGUAGES = {
-    "ar": "Arabic",
-    "da": "Danish",
-    "de": "German",
-    "el": "Greek",
-    "en": "English",
-    "es": "Spanish",
-    "fi": "Finnish",
-    "fr": "French",
-    "he": "Hebrew",
-    "hi": "Hindi",
-    "it": "Italian",
-    "ja": "Japanese",
-    "ko": "Korean",
-    "ms": "Malay",
-    "nl": "Dutch",
-    "no": "Norwegian",
-    "pl": "Polish",
-    "pt": "Portuguese",
-    "ru": "Russian",
-    "sv": "Swedish",
-    "sw": "Swahili",
-    "tr": "Turkish",
-    "zh": "Chinese",
-}
-
-
-def punc_norm(text: str) -> str:
-    if not text:
-        return "You need to add some text for me to talk."
-
-    if text[0].islower():
-        text = text[0].upper() + text[1:]
-
-    text = " ".join(text.split())
-
-    replacements = [
-        ("...", ", "),
-        ("…", ", "),
-        (":", ","),
-        (" - ", ", "),
-        (";", ", "),
-        ("—", "-"),
-        ("–", "-"),
-        (" ,", ","),
-        ("“", '"'),
-        ("”", '"'),
-        ("‘", "'"),
-        ("’", "'"),
-    ]
-    for a, b in replacements:
-        text = text.replace(a, b)
-
-    if not text.endswith((".", "!", "?", ",")):
-        text += "."
-
-    return text
 
 
 # ======================================================
@@ -100,10 +41,7 @@ class Conditionals:
         return self
 
     def save(self, fpath: Path):
-        torch.save(
-            {"t3": self.t3.__dict__, "gen": self.gen},
-            fpath,
-        )
+        torch.save({"t3": self.t3.__dict__, "gen": self.gen}, fpath)
 
     @classmethod
     def load(cls, fpath):
@@ -131,21 +69,19 @@ class ChatterboxMultilingualTTS:
     # --------------------------------------------------
     # LOADERS
     # --------------------------------------------------
-    #@classmethod
     @classmethod
     def from_local(cls, ckpt_dir, device="cpu"):
-    # your existing code
-
-    #def from_local(cls, ckpt_dir):
         ckpt_dir = Path(ckpt_dir)
 
+        # Voice Encoder
         ve = VoiceEncoder()
-        ve.load_state_dict(torch.load(ckpt_dir / "ve.pt", map_location="cpu", weights_only=True))
-        ve.to(DEVICE).eval()
+        ve.load_state_dict(
+            torch.load(ckpt_dir / "ve.pt", map_location="cpu", weights_only=True)
+        )
+        ve.to(device).eval()
 
+        # T3
         t3 = T3(T3Config.multilingual())
-
-        # CPU-safe attention
         if hasattr(t3.tfmr.config, "attn_implementation"):
             t3.tfmr.config.attn_implementation = "eager"
 
@@ -154,34 +90,30 @@ class ChatterboxMultilingualTTS:
             t3_state = t3_state["model"][0]
 
         t3.load_state_dict(t3_state)
-        t3.to(DEVICE).eval()
+        t3.to(device).eval()
 
+        # S3 Generator
         s3gen = S3Gen()
         s3gen.load_state_dict(
             torch.load(ckpt_dir / "s3gen.pt", map_location="cpu", weights_only=True)
         )
-        s3gen.to(DEVICE).eval()
+        s3gen.to(device).eval()
 
-        tokenizer = MTLTokenizer(str(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json"))
+        # Tokenizer
+        tokenizer = MTLTokenizer(
+            str(ckpt_dir / "grapheme_mtl_merged_expanded_v1.json")
+        )
 
-        # conds = None
-        # conds_path = ckpt_dir / "conds.pt"
-        # conds = Conditionals.load(conds_path)
-        #  # manually move internal tensors if needed
-        # conds.t3 = conds.t3.to('cpu')
-        # #if conds_path.exists():
-        #     #conds = Conditionals.load(conds_path).to(DEVICE)
-
-
-
+        # Conditionals
         conds = None
-        if (builtin_voice := ckpt_dir / "conds.pt").exists():
+        builtin_voice = ckpt_dir / "conds.pt"
+        if builtin_voice.exists():
             conds = Conditionals.load(builtin_voice).to(device)
 
         return cls(t3, s3gen, ve, tokenizer, conds)
-        
+
     @classmethod
-    def from_pretrained(cls, device: torch.device) -> "ChatterboxMultilingualTTS":
+    def from_pretrained(cls, device=torch.device("cpu")):
         ckpt_dir = Path(
             snapshot_download(
                 repo_id=REPO_ID,
@@ -193,13 +125,11 @@ class ChatterboxMultilingualTTS:
                     "s3gen.pt",
                     "grapheme_mtl_merged_expanded_v1.json",
                     "conds.pt",
-                    "Cangjie5_TC.json",
                 ],
                 token=os.getenv("HF_TOKEN"),
             )
         )
         return cls.from_local(ckpt_dir, device)
-    
 
     # --------------------------------------------------
     # CONDITION PREP
@@ -209,7 +139,6 @@ class ChatterboxMultilingualTTS:
         wav_16k = librosa.resample(wav, S3GEN_SR, S3_SR)
 
         wav = wav[: self.DEC_COND_LEN]
-
         gen_dict = self.s3gen.embed_ref(wav, S3GEN_SR, device=self.device)
 
         tokens = None
@@ -235,27 +164,14 @@ class ChatterboxMultilingualTTS:
     # --------------------------------------------------
     # GENERATION
     # --------------------------------------------------
-    def generate(
-        self,
-        text,
-        language_id,
-        audio_prompt_path=None,
-        exaggeration=0.5,
-        cfg_weight=0.5,
-        temperature=0.8,
-        repetition_penalty=2.0,
-        min_p=0.05,
-        top_p=1.0,
-    ):
-        if language_id not in SUPPORTED_LANGUAGES:
-            raise ValueError(f"Unsupported language: {language_id}")
+    def generate(self, text, language_id, audio_prompt_path=None, exaggeration=0.5,
+                 cfg_weight=0.5, temperature=0.8, repetition_penalty=2.0,
+                 min_p=0.05, top_p=1.0):
 
         if audio_prompt_path:
             self.prepare_conditionals(audio_prompt_path, exaggeration)
         elif self.conds is None:
             raise RuntimeError("Conditionals not prepared")
-
-        text = punc_norm(text)
 
         tokens = self.tokenizer.text_to_tokens(text, language_id).to(self.device)
         tokens = torch.cat([tokens, tokens], dim=0)
