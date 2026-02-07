@@ -491,80 +491,299 @@ class T3ForFineTuning(torch.nn.Module):
 
 # --- Main function ---
 def main():
-    parser = HfArgumentParser(
-        (ModelArguments, DataArguments, CustomTrainingArguments)
-    )
+
+    global trainer_instance
+
+    parser = HfArgumentParser((ModelArguments, DataArguments, CustomTrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
+    logging.basicConfig(
+        format="%(asctime)s - %(levelname)s - %(name)s - %(message)s",
+        datefmt="%m/%d/%Y %H:%M:%S",
+        level=logging.INFO if training_args.local_rank in [-1, 0] else logging.WARN,
+    )
+    logger.info("Training/evaluation parameters %s", training_args)
+    logger.info("Model parameters %s", model_args)
+    logger.info("Data parameters %s", data_args)
     set_seed(training_args.seed)
 
-    # --- Load HF dataset ---
+    logger.info("Loading ChatterboxTTS model...")
+
+    original_model_dir_for_copy: Optional[Path] = None
+    if model_args.local_model_dir:
+        logger.info(f"Loading model from local directory: {model_args.local_model_dir}")
+        local_dir_path = Path(model_args.local_model_dir)
+        chatterbox_model = ChatterboxMultilingualTTS.from_pretrained(device="cpu")
+        original_model_dir_for_copy = local_dir_path
+    else:
+        repo_to_download = model_args.model_name_or_path or REPO_ID
+        logger.info(f"Loading model from Hugging Face Hub: {repo_to_download}")
+        download_dir = Path(training_args.output_dir) / "pretrained_model_download"
+        download_dir.mkdir(parents=True, exist_ok=True)
+        files_to_download = [
+            "ve.safetensors",
+            "t3_mtl23ls_v2.safetensors",
+            "s3gen.safetensors",
+            "mtl_tokenizer.json",
+        ]
+
+        from huggingface_hub import hf_hub_download as hf_download
+
+        for f in files_to_download:
+            try:
+                hf_download(
+                    repo_id=repo_to_download,
+                    filename=f,
+                    local_dir=download_dir,
+                    local_dir_use_symlinks=False,
+                    cache_dir=model_args.cache_dir,
+                )
+            except Exception as e:
+                logger.warning(f"Could not download {f} from {repo_to_download}: {e}.")
+
+        try:
+            hf_download(
+                repo_id=repo_to_download,
+                filename="conds.pt",
+                local_dir=download_dir,
+                local_dir_use_symlinks=False,
+                cache_dir=model_args.cache_dir,
+            )
+        except:
+            logger.info(
+                "conds.pt not found on Hub or failed to download for this model."
+            )
+
+        chatterbox_model = ChatterboxMultilingualTTS.from_pretrained(device="cpu")
+        original_model_dir_for_copy = download_dir
+
+    t3_model = chatterbox_model.t3
+    chatterbox_t3_config_instance = t3_model.hp
+
+    if model_args.freeze_voice_encoder:
+        for param in chatterbox_model.ve.parameters():
+            param.requires_grad = False
+        logger.info("Voice Encoder frozen.")
+    if model_args.freeze_s3gen:
+        for param in chatterbox_model.s3gen.parameters():
+            param.requires_grad = False
+        logger.info("S3Gen model frozen.")
+    for param in t3_model.parameters():
+        param.requires_grad = True
+    logger.info("T3 model set to trainable.")
+
+    logger.info("Loading and processing dataset...")
+    raw_datasets = DatasetDict()
+    verification_mode = (
+        VerificationMode.NO_CHECKS
+        if data_args.ignore_verifications
+        else VerificationMode.BASIC_CHECKS
+    )
+
+    train_hf_dataset: Union[datasets.Dataset, List[Dict[str, str]]]
+    eval_hf_dataset: Optional[Union[datasets.Dataset, List[Dict[str, str]]]] = None
+
     if data_args.dataset_name:
-        hf_dataset = load_dataset(
+        logger.info(
+            f"Loading dataset '{data_args.dataset_name}' from Hugging Face Hub."
+        )
+        raw_datasets_loaded = load_dataset(  # Use a different var name to avoid conflict with outer raw_datasets
             data_args.dataset_name,
             data_args.dataset_config_name,
             cache_dir=model_args.cache_dir,
+            verification_mode=verification_mode,
+            # trust_remote_code=True # If dataset script requires it
         )
-        train_hf_dataset = hf_dataset[data_args.train_split_name]
-        eval_hf_dataset = (
-            hf_dataset[data_args.eval_split_name]
-            if data_args.eval_split_name in hf_dataset
-            else None
-        )
+        if data_args.train_split_name not in raw_datasets_loaded:
+            raise ValueError(
+                f"Train split '{data_args.train_split_name}' not found. Available: {list(raw_datasets_loaded.keys())}"
+            )
+        train_hf_dataset = raw_datasets_loaded[data_args.train_split_name]
 
-        # ======= FIX: Cast audio column to proper numpy arrays =======
-        if data_args.audio_column_name in train_hf_dataset.column_names:
-            train_hf_dataset = train_hf_dataset.cast_column(
-                data_args.audio_column_name, Audio(sampling_rate=S3_SR)
-            )
-        if eval_hf_dataset and data_args.audio_column_name in eval_hf_dataset.column_names:
-            eval_hf_dataset = eval_hf_dataset.cast_column(
-                data_args.audio_column_name, Audio(sampling_rate=S3_SR)
-            )
+        if training_args.do_eval:
+            if (
+                data_args.eval_split_name
+                and data_args.eval_split_name in raw_datasets_loaded
+            ):
+                eval_hf_dataset = raw_datasets_loaded[data_args.eval_split_name]
+            elif "validation" in raw_datasets_loaded:
+                eval_hf_dataset = raw_datasets_loaded["validation"]
+            elif "test" in raw_datasets_loaded:
+                eval_hf_dataset = raw_datasets_loaded["test"]
+            elif (
+                data_args.eval_split_size > 0 and len(train_hf_dataset) > 1
+            ):  # Ensure dataset is splittable
+                logger.info(
+                    f"Splitting train dataset for evaluation with ratio {data_args.eval_split_size}"
+                )
+                split_dataset = train_hf_dataset.train_test_split(
+                    test_size=data_args.eval_split_size, seed=training_args.seed
+                )
+                train_hf_dataset, eval_hf_dataset = (
+                    split_dataset["train"],
+                    split_dataset["test"],
+                )
+                logger.info(f"Evaluation set size: {len(eval_hf_dataset)}")
+            else:
+                logger.warning(
+                    "Evaluation requested but no eval split found/configured or train dataset too small to split. Skipping eval dataset."
+                )
+        is_hf_format_train, is_hf_format_eval = True, True
     else:
-        raise ValueError("Please provide a HF dataset name or local dataset dir.")
+        all_files = []
+        if data_args.metadata_file:
+            metadata_path = Path(data_args.metadata_file)
+            dataset_root = metadata_path.parent
+            with open(metadata_path, "r", encoding="utf-8") as f:
+                for line_idx, line in enumerate(f):
+                    parts = line.strip().split("|")
+                    if len(parts) != 2:
+                        parts = line.strip().split("\t")
+                    if len(parts) == 2:
+                        audio_file, text = parts
+                        audio_path = (
+                            Path(audio_file)
+                            if Path(audio_file).is_absolute()
+                            else dataset_root / audio_file
+                        )
+                        if audio_path.exists():
+                            all_files.append({"audio": str(audio_path), "text": text})
+                        else:
+                            logger.warning(
+                                f"Audio file not found: {audio_path} (line {line_idx+1}). Skipping."
+                            )
+                    else:
+                        logger.warning(
+                            f"Skipping malformed line in metadata (line {line_idx+1}): {line.strip()}"
+                        )
+        elif data_args.dataset_dir:
+            dataset_path = Path(data_args.dataset_dir)
+            for audio_file_path in dataset_path.rglob("*.wav"):
+                text_file_path = audio_file_path.with_suffix(".txt")
+                if text_file_path.exists():
+                    with open(text_file_path, "r", encoding="utf-8") as f:
+                        text = f.read().strip()
+                    all_files.append({"audio": str(audio_file_path), "text": text})
+        if not all_files:
+            raise ValueError(
+                "No data files found from local paths. Check dataset_dir or metadata_file."
+            )
+        np.random.shuffle(all_files)
+        train_hf_dataset = all_files  # type: ignore
+        if (
+            data_args.eval_split_size > 0
+            and training_args.do_eval
+            and len(all_files) > 1
+        ):
+            split_idx = int(len(all_files) * (1 - data_args.eval_split_size))
+            if split_idx == 0:
+                split_idx = 1  # Ensure at least one for train if eval gets most
+            if split_idx == len(all_files):
+                split_idx = len(all_files) - 1  # Ensure at least one for eval
+            train_hf_dataset, eval_hf_dataset = all_files[:split_idx], all_files[split_idx:]  # type: ignore
+        is_hf_format_train, is_hf_format_eval = False, False
 
-    # --- Load Chatterbox model ---
-    chatterbox_model = ChatterboxMultilingualTTS()
-
-    # chatterbox_model = ChatterboxMultilingualTTS(
-    #     model_name_or_path=model_args.model_name_or_path
-    # )
-    t3_model = chatterbox_model.t3
-    t3_config = chatterbox_model.t3_cfg
-
-    # --- Build datasets ---
     train_dataset = SpeechFineTuningDataset(
-        data_args, chatterbox_model, t3_config, train_hf_dataset, is_hf_format=True
+        data_args,
+        chatterbox_model,
+        chatterbox_t3_config_instance,
+        train_hf_dataset,
+        is_hf_format_train,
     )
-    eval_dataset = (
-        SpeechFineTuningDataset(
-            data_args, chatterbox_model, t3_config, eval_hf_dataset, is_hf_format=True
+
+    eval_dataset = None
+    if eval_hf_dataset and training_args.do_eval:
+        eval_dataset = SpeechFineTuningDataset(
+            data_args,
+            chatterbox_model,
+            chatterbox_t3_config_instance,
+            eval_hf_dataset,
+            is_hf_format_eval,
         )
-        if eval_hf_dataset
-        else None
-    )
 
     data_collator = SpeechDataCollator(
-        t3_config=t3_config,
-        text_pad_token_id=t3_config.start_text_token,
-        speech_pad_token_id=t3_config.start_speech_token,
+        chatterbox_t3_config_instance,
+        chatterbox_t3_config_instance.stop_text_token,
+        chatterbox_t3_config_instance.stop_speech_token,
     )
 
-    model_for_training = T3ForFineTuning(t3_model, t3_config)
+    hf_trainable_model = T3ForFineTuning(t3_model, chatterbox_t3_config_instance)
 
-    trainer = Trainer(
-        model=model_for_training,
+    callbacks = []
+    if (
+        training_args.early_stopping_patience is not None
+        and training_args.early_stopping_patience > 0
+    ):
+        callbacks.append(
+            EarlyStoppingCallback(
+                early_stopping_patience=training_args.early_stopping_patience
+            )
+        )
+
+    trainer_instance = Trainer(
+        model=hf_trainable_model,
         args=training_args,
         train_dataset=train_dataset,
         eval_dataset=eval_dataset,
         data_collator=data_collator,
-        callbacks=[EarlyStoppingCallback(early_stopping_patience=training_args.early_stopping_patience)]
-        if training_args.early_stopping_patience
-        else None,
+        callbacks=callbacks if callbacks else None,
     )
 
-    trainer.train()
+    if training_args.label_names is None:
+        trainer_instance.label_names = ["lables"]
+
+    if training_args.do_train:
+        logger.info("*** Training T3 model ***")
+        train_result = trainer_instance.train(
+            resume_from_checkpoint=training_args.resume_from_checkpoint
+        )
+        trainer_instance.save_model()
+
+        logger.info("Saving finetuned T3 model weights for ChatterboxTTS...")
+        t3_to_save = (
+            trainer_instance.model.t3
+            if hasattr(trainer_instance.model, "t3")
+            else trainer_instance.model.module.t3
+        )
+        finetuned_t3_state_dict = t3_to_save.state_dict()
+
+        output_t3_safetensor_path = (
+            Path(training_args.output_dir) / "t3_mtl23ls_v2.safetensors"
+        )
+        from safetensors.torch import save_file
+
+        save_file(finetuned_t3_state_dict, output_t3_safetensor_path)
+        logger.info(f"Finetuned T3 model weights saved to {output_t3_safetensor_path}")
+
+        if original_model_dir_for_copy:
+            import shutil
+
+            for f_name in ["ve.safetensors", "s3gen.safetensors", "mtl_tokenizer.json"]:
+                src_path = original_model_dir_for_copy / f_name
+                if src_path.exists():
+                    shutil.copy2(src_path, Path(training_args.output_dir) / f_name)
+            if (original_model_dir_for_copy / "conds.pt").exists():
+                shutil.copy2(
+                    original_model_dir_for_copy / "conds.pt",
+                    Path(training_args.output_dir) / "conds.pt",
+                )
+            logger.info(
+                f"Full model components structured in {training_args.output_dir}"
+            )
+
+        metrics = train_result.metrics
+        trainer_instance.log_metrics("train", metrics)
+        trainer_instance.save_metrics("train", metrics)
+        trainer_instance.save_state()
+
+    if training_args.do_eval and eval_dataset:
+        logger.info("*** Evaluating T3 model ***")
+        metrics = trainer_instance.evaluate()
+        trainer_instance.log_metrics("eval", metrics)
+        trainer_instance.save_metrics("eval", metrics)
+
+    logger.info("Finetuning script finished.")
+
 
 
 if __name__ == "__main__":
