@@ -525,9 +525,11 @@ def main():
         raise ValueError("Please provide a HF dataset name or local dataset dir.")
 
     # --- Load Chatterbox model ---
-    chatterbox_model = ChatterboxMultilingualTTS(
-        model_name_or_path=model_args.model_name_or_path
-    )
+    chatterbox_model = ChatterboxMultilingualTTS()
+
+    # chatterbox_model = ChatterboxMultilingualTTS(
+    #     model_name_or_path=model_args.model_name_or_path
+    # )
     t3_model = chatterbox_model.t3
     t3_config = chatterbox_model.t3_cfg
 
