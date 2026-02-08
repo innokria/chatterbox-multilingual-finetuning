@@ -16,12 +16,39 @@ from transformers import (
 )
 from safetensors.torch import save_file
 
-from src.models.t3 import T3
-from src.models.t3.modules.t3_config import T3Config
-from src.models.s3tokenizer import S3_SR
-from src.chatterbox_multilingual import ChatterboxMultilingualTTS
-from src.dataset import SpeechFineTuningDataset, SpeechDataCollator
-from src.t3_for_finetuning import T3ForFineTuning
+import argparse
+import logging
+import os
+import json
+from pathlib import Path
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Union, Any
+
+import torch
+import torch.nn.functional as F
+from torch.utils.data import Dataset
+import librosa
+import numpy as np
+from torch.utils.tensorboard import SummaryWriter
+
+from transformers import (
+    HfArgumentParser,
+    EarlyStoppingCallback,
+    set_seed,
+    TrainerCallback,
+    Trainer,
+    PretrainedConfig,
+)
+from transformers import TrainingArguments as HfTrainingArguments
+from datasets import load_dataset, DatasetDict, VerificationMode, Audio
+import datasets
+
+from chatterbox.mtl_tts import ChatterboxMultilingualTTS
+from chatterbox.tts import ChatterboxTTS, Conditionals, punc_norm, REPO_ID
+from chatterbox.models.t3.t3 import T3, T3Cond
+from chatterbox.models.t3.modules.t3_config import T3Config
+from chatterbox.models.s3tokenizer import S3_SR, SPEECH_VOCAB_SIZE
+from chatterbox.models.s3gen import S3GEN_SR
 
 logger = logging.getLogger(__name__)
 REPO_ID = "rahul7star/chatterbox-v2-exp/pretrained_model_download"
