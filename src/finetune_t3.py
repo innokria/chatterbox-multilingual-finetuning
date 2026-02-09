@@ -528,7 +528,7 @@ def main():
     
 
     chatterbox_model = ChatterboxMultilingualTTS(
-        model_name_or_path=model_args.model_name_or_path,
+        
           device="cpu",
     )
     t3_model = chatterbox_model.t3
