@@ -138,7 +138,7 @@ class ChatterboxMultilingualTTS:
         self.ve = ve
         self.tokenizer = tokenizer
         self.conds = conds
-        self.watermarker = perth.PerthImplicitWatermarker()
+        self.watermarker = None
 
     # --------------------------------------------------
     # LOADERS
