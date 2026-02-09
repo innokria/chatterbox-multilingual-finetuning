@@ -527,10 +527,8 @@ def main():
     # --- Load Chatterbox model ---
     
 
-    chatterbox_model = ChatterboxMultilingualTTS(
-        
-          device="cpu",
-    )
+    
+    chatterbox_model = ChatterboxMultilingualTTS.from_pretrained(device="cpu")
     t3_model = chatterbox_model.t3
     t3_config = chatterbox_model.t3_cfg
 
