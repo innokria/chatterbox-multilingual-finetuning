@@ -530,8 +530,8 @@ def main():
     
     chatterbox_model = ChatterboxMultilingualTTS.from_pretrained(device="cpu")
     t3_model = chatterbox_model.t3
-    t3_config = chatterbox_model.t3_cfg
-
+    t3_config = chatterbox_model.modules.t3_cfg
+   
     # --- Build datasets ---
     train_dataset = SpeechFineTuningDataset(
         data_args, chatterbox_model, t3_config, train_hf_dataset, is_hf_format=True
