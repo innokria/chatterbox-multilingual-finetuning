@@ -639,8 +639,26 @@ def main():
         else VerificationMode.BASIC_CHECKS
     )
 
-    train_hf_dataset: Union[datasets.Dataset, List[Dict[str, str]]]
-    eval_hf_dataset: Optional[Union[datasets.Dataset, List[Dict[str, str]]]] = None
+   # train_hf_dataset: Union[datasets.Dataset, List[Dict[str, str]]]
+   # eval_hf_dataset: Optional[Union[datasets.Dataset, List[Dict[str, str]]]] = None
+
+   
+
+
+    # After loading the dataset, before passing to SpeechFineTuningDataset
+   def decode_audio(example):
+    # Ensure audio is loaded as np.ndarray
+     if isinstance(example["audio"], dict) and "array" in example["audio"]:
+        example["audio"] = example["audio"]["array"]
+     elif hasattr(example["audio"], "array"):
+        example["audio"] = example["audio"].array
+     return example
+
+   train_hf_dataset = train_hf_dataset.map(decode_audio)
+    if eval_hf_dataset:
+     eval_hf_dataset = eval_hf_dataset.map(decode_audio)
+
+    
 
     if data_args.dataset_name:
         logger.info(
